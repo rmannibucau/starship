@@ -70,45 +70,45 @@ fn load() -> Cache {
 fn serialize(output: &CommandOutput) -> Box<[u8]> {
     let stdout = output.stdout.as_bytes();
     let stderr = output.stderr.as_bytes();
-    let mut data = Vec::with_capacity(8 + stdout.len() + stderr.len());
+    let stdout_len = u64::try_from(stdout.len()).unwrap_or(u64::MAX);
+    let stderr_len = u64::try_from(stderr.len()).unwrap_or(u64::MAX);
+    let mut data = Vec::with_capacity(16 + stdout.len() + stderr.len());
     // Length-prefixed encoding so that arbitrary output (including a NUL byte) round-trips
-    // without ambiguity between stdout and stderr.
-    data.extend_from_slice(&(stdout.len() as u32).to_le_bytes());
+    // without ambiguity between stdout and stderr. Lengths are stored as 64-bit values so their
+    // conversion never wraps on any supported platform.
+    data.extend_from_slice(&stdout_len.to_le_bytes());
     data.extend_from_slice(stdout);
-    data.extend_from_slice(&(stderr.len() as u32).to_le_bytes());
+    data.extend_from_slice(&stderr_len.to_le_bytes());
     data.extend_from_slice(stderr);
     data.into_boxed_slice()
 }
 
-fn deserialize(data: &[u8]) -> CommandOutput {
+/// Decodes a value written by [`serialize`]. Returns `None` when the payload is truncated or
+/// declares a length beyond its own data so callers can treat malformed entries as a cache miss
+/// instead of silently returning empty output.
+fn deserialize(data: &[u8]) -> Option<CommandOutput> {
     let mut offset = 0;
-    let stdout = {
-        let stdout_len = read_length(data, &mut offset);
-        let bytes = data
-            .get(offset..offset.saturating_add(stdout_len))
-            .unwrap_or_default();
-        offset = offset.saturating_add(stdout_len);
-        String::from_utf8_lossy(bytes).into_owned()
-    };
-    let stderr = {
-        let stderr_len = read_length(data, &mut offset);
-        let bytes = data
-            .get(offset..offset.saturating_add(stderr_len))
-            .unwrap_or_default();
-        String::from_utf8_lossy(bytes).into_owned()
-    };
-    CommandOutput { stdout, stderr }
+    let stdout_len = read_length(data, &mut offset)?;
+    let stdout = data.get(offset..offset.checked_add(stdout_len)?)?;
+    offset = offset.checked_add(stdout_len)?;
+    let stderr_len = read_length(data, &mut offset)?;
+    let stderr = data.get(offset..offset.checked_add(stderr_len)?)?;
+    Some(CommandOutput {
+        stdout: String::from_utf8_lossy(stdout).into_owned(),
+        stderr: String::from_utf8_lossy(stderr).into_owned(),
+    })
 }
 
-/// Reads a 32-bit little-endian length from `bytes` starting at `offset`, advancing `offset` past
-/// it. Returns `0` on a truncated or out-of-range payload so the reader degrades gracefully.
-fn read_length(bytes: &[u8], offset: &mut usize) -> usize {
-    if bytes.len().saturating_sub(*offset) < 4 {
-        return 0;
-    }
-    let len = u32::from_le_bytes(bytes[*offset..*offset + 4].try_into().unwrap()) as usize;
-    *offset += 4;
-    len
+/// Reads a 64-bit little-endian length from `bytes` starting at `offset`, advancing `offset` past
+/// it. Returns `None` on a truncated, out-of-range, or unrepresentable payload.
+fn read_length(bytes: &[u8], offset: &mut usize) -> Option<usize> {
+    let start = *offset;
+    let end = start.checked_add(8)?;
+    let raw = bytes.get(start..end)?;
+    let len = u64::from_le_bytes(raw.try_into().ok()?);
+    let len = usize::try_from(len).ok()?;
+    *offset = end;
+    Some(len)
 }
 
 /// Builds a stable cache key for a command invocation.
@@ -120,7 +120,8 @@ fn read_length(bytes: &[u8], offset: &mut usize) -> usize {
 /// projects. Callers whose output is context-independent (e.g. `mvn --version`) pass `None`.
 ///
 /// Each part is encoded as `len:value` (with the byte length) so that distinct argument vectors
-/// such as `['a b']` and `['a', 'b']` do not share a key.
+/// such as `['a b']` and `['a', 'b']` do not share a key. Paths and arguments are encoded
+/// losslessly so directories differing only in non-UTF-8 bytes still produce distinct keys.
 pub fn key<T: AsRef<OsStr> + Debug, U: AsRef<OsStr> + Debug>(
     cwd: Option<&Path>,
     cmd: T,
@@ -128,21 +129,33 @@ pub fn key<T: AsRef<OsStr> + Debug, U: AsRef<OsStr> + Debug>(
 ) -> String {
     let mut parts = Vec::new();
     if let Some(cwd) = cwd {
-        parts.push(cwd.to_string_lossy().into_owned());
+        parts.push(encode_part(cwd.as_os_str()));
     }
     match resolve_binary(cmd.as_ref()) {
-        Some(path) => parts.push(path.to_string_lossy().into_owned()),
-        None => parts.push(cmd.as_ref().to_string_lossy().into_owned()),
+        Some(path) => parts.push(encode_part(path.as_os_str())),
+        None => parts.push(encode_part(cmd.as_ref())),
     }
-    parts.extend(
-        args.iter()
-            .map(|arg| arg.as_ref().to_string_lossy().into_owned()),
-    );
+    parts.extend(args.iter().map(|arg| encode_part(arg.as_ref())));
     parts
         .into_iter()
         .map(|part| format!("{}:{part}", part.len()))
         .collect::<Vec<_>>()
         .join("")
+}
+
+/// Encodes an OS string into injective ASCII. Non-ASCII bytes (including bytes that have no UTF-8
+/// interpretation, such as in a non-UTF-8 file name) are escaped as `\xHH`, and a literal backslash
+/// is escaped the same way so two distinct inputs can never produce the same key.
+fn encode_part(part: &OsStr) -> String {
+    let mut encoded = String::new();
+    for &byte in part.as_encoded_bytes() {
+        if (0x20..0x7f).contains(&byte) && byte != b'\\' {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("\\x{byte:02x}"));
+        }
+    }
+    encoded
 }
 
 /// Resolves `cmd` to its canonical real location, following up to 10 symlink hops.
@@ -179,7 +192,7 @@ pub fn get(key: &str, ttl: u64) -> Option<CommandOutput> {
     if now().saturating_sub(entry.written_at) > ttl {
         return None;
     }
-    Some(deserialize(&entry.value))
+    deserialize(&entry.value)
 }
 
 /// A best-effort cross-process lock backed by an atomic `create_new` lock file. Serializes
@@ -416,7 +429,7 @@ mod tests {
             stderr: "err\x00too".to_string(),
         };
         let data = serialize(&output);
-        let back = deserialize(&data);
+        let back = deserialize(&data).unwrap();
         assert_eq!(back.stdout, "line\x00with nul");
         assert_eq!(back.stderr, "err\x00too");
     }
@@ -427,9 +440,42 @@ mod tests {
             stdout: "out".to_string(),
             stderr: String::new(),
         };
-        let back = deserialize(&serialize(&output));
+        let back = deserialize(&serialize(&output)).unwrap();
         assert_eq!(back.stdout, "out");
         assert_eq!(back.stderr, "");
+    }
+
+    #[test]
+    fn deserialize_rejects_truncated_payload() {
+        let full = serialize(&sample_output());
+        for cut in 0..full.len() {
+            assert_eq!(deserialize(&full[..cut]), None, "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn deserialize_rejects_oversized_length() {
+        // A header declaring more bytes than the payload holds must be a miss, not empty output.
+        let mut data = vec![0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        data.extend_from_slice(b"short");
+        assert_eq!(deserialize(&data), None);
+    }
+
+    #[test]
+    fn malformed_payload_is_a_cache_miss() {
+        with_temp_path(|path| {
+            let mut cache = Cache::default();
+            cache.entries.insert(
+                "/mvn".into(),
+                CacheEntry {
+                    value: vec![0xff, 0xff, 0xff, 0xff].into_boxed_slice(),
+                    written_at: now(),
+                },
+            );
+            std::fs::write(path, serde_json::to_vec(&cache).unwrap()).unwrap();
+
+            assert_eq!(get("/mvn", 3600), None);
+        });
     }
 
     #[test]
@@ -453,6 +499,18 @@ mod tests {
         let a = key(None, "git", &["branch"]);
         let b = key(None, "git", &["branch"]);
         assert_eq!(a, b);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_distinguishes_non_utf8_directories() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let cwd_a = Path::new(OsStr::from_bytes(b"/proj/foo\xff"));
+        let cwd_b = Path::new(OsStr::from_bytes(b"/proj/foo\xfe"));
+        let a = key(Some(cwd_a), "git", &["branch"]);
+        let b = key(Some(cwd_b), "git", &["branch"]);
+        assert_ne!(a, b);
     }
 
     #[test]
