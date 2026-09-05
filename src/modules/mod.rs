@@ -59,7 +59,6 @@ mod line_break;
 mod localip;
 mod lua;
 mod maven;
-mod maven_cache;
 mod memory_usage;
 mod meson;
 mod mise;

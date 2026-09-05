@@ -31,6 +31,12 @@
       "minimum": 0,
       "default": 500
     },
+    "command_cache_ttl": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0,
+      "default": 0
+    },
     "add_newline": {
       "type": "boolean",
       "default": true

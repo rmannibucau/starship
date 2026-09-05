@@ -4,7 +4,8 @@
 
 ### Features
 
-* **maven:** fall back to the local `mvn` binary version when no Maven wrapper is present, and cache it between prompts (configurable via `cache` and `cache_ttl`)
+* **maven:** fall back to the local `mvn` binary version when no Maven wrapper is present, and cache it between prompts using the shared command cache (configurable via `cache` and `cache_ttl`)
+* add a shared, cross-process cache for command output, enabled per prompt via the `command_cache_ttl` configuration option
 
 ## [1.26.0](https://github.com/starship/starship/compare/v1.25.1...v1.26.0) (2026-06-28)
 

@@ -480,12 +480,31 @@ impl<'a> Context<'a> {
                 return output;
             }
         }
-        let mut cmd = create_command(cmd).ok()?;
-        cmd.args(args).current_dir(&self.current_dir);
-        exec_timeout(
-            &mut cmd,
+
+        // A global, shared, cross-process cache for command output. It is only active when the
+        // user configures a positive TTL; a TTL of 0 (the default) keeps the historical behavior
+        // of always executing the command. The key includes the resolved binary so that a switch
+        // of the underlying installation (e.g. via SDKMAN) naturally invalidates the entry.
+        let cache_ttl = self.root_config.command_cache_ttl;
+        let cache_key = (cache_ttl > 0).then(|| crate::utils::command_cache::key(&cmd, args));
+        if let Some(key) = cache_key.as_deref()
+            && let Some(output) = crate::utils::command_cache::get(key, cache_ttl)
+        {
+            return Some(output);
+        }
+
+        let mut command = create_command(cmd).ok()?;
+        command.args(args).current_dir(&self.current_dir);
+        let output = exec_timeout(
+            &mut command,
             Duration::from_millis(self.root_config.command_timeout),
-        )
+        );
+
+        if let (Some(key), Some(output)) = (cache_key.as_deref(), output.as_ref()) {
+            crate::utils::command_cache::set(key, output.clone(), cache_ttl);
+        }
+
+        output
     }
 
     /// Attempt to execute several commands with `exec_cmd`, return the results of the first that works

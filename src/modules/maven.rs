@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::{
     config::ModuleConfig,
@@ -6,10 +6,8 @@ use crate::{
     context::Context,
     formatter::{StringFormatter, VersionFormatter},
     module::Module,
-    utils,
+    utils::{self, command_cache},
 };
-
-use super::maven_cache;
 
 pub fn module<'a>(context: &'a Context) -> Option<Module<'a>> {
     let mut module = context.new_module("maven");
@@ -91,57 +89,29 @@ fn parse_maven_version_from_properties(wrapper_properties: &str) -> Option<Strin
 }
 
 /// The version of the `mvn` binary installed on the machine, resolved if available and not
-/// served by the persistent cache.
+/// served by the shared persistent cache.
 fn get_mvn_version(context: &Context, cache_enabled: bool, cache_ttl: u64) -> Option<String> {
-    // Resolve the concrete `mvn` binary so the cache can be keyed to a specific
-    // installation (e.g. an SDKMAN-managed version). This also follows symlinks.
-    let binary = resolve_mvn_binary();
     let binary_name = if cfg!(windows) { "mvn.cmd" } else { "mvn" };
+    // The shared cache key incorporates the resolved binary (e.g. an SDKMAN-managed version), so
+    // a change of the underlying installation naturally invalidates the cached entry.
+    let key = command_cache::key(binary_name, &["--version"]);
 
-    // Serve from the cache first when it is enabled and the entry is fresh enough.
+    // Serve from the shared cache first when it is enabled and the entry is fresh enough.
     if cache_enabled
-        && let Some(binary) = binary.as_ref()
-        && let Some(version) = maven_cache::get(binary, cache_ttl)
+        && let Some(output) = command_cache::get(&key, cache_ttl)
+        && let Some(version) = parse_mvn_version(&output.stdout)
     {
         return Some(version);
     }
 
-    let version = parse_mvn_version(&context.exec_cmd(binary_name, &["--version"])?.stdout)?;
+    let output = context.exec_cmd(binary_name, &["--version"])?;
+    let version = parse_mvn_version(&output.stdout)?;
 
-    if cache_enabled && let Some(binary) = binary.as_ref() {
-        maven_cache::set(binary, version.clone());
+    if cache_enabled {
+        command_cache::set(&key, output, cache_ttl);
     }
 
     Some(version)
-}
-
-/// The canonical location of the `mvn` binary, following symlinks (bounded to avoid cycles).
-fn resolve_mvn_binary() -> Option<PathBuf> {
-    let exe = if cfg!(windows) { "mvn.cmd" } else { "mvn" };
-    let found = which::which(exe).ok()?;
-    Some(resolve_symlinks_bounded(&found))
-}
-
-/// Resolves `path` to its canonical real location, following up to 10 symlink hops.
-fn resolve_symlinks_bounded(path: &Path) -> PathBuf {
-    let mut current = path.to_path_buf();
-    for _ in 0..10 {
-        match std::fs::read_link(&current) {
-            Ok(target) => {
-                current = if target.is_absolute() {
-                    target
-                } else {
-                    match current.parent() {
-                        Some(dir) => dir.join(target),
-                        None => target,
-                    }
-                };
-            }
-            Err(_) => break,
-        }
-    }
-
-    dunce::canonicalize(&current).unwrap_or(current)
 }
 
 /// Parses the Maven version from the first line of `mvn --version`, e.g.
@@ -418,27 +388,5 @@ wrapperVersion=3.3.4
     #[test]
     fn test_format_mvn_version_garbage() {
         assert_eq!(parse_mvn_version("not a maven output\n"), None);
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn resolve_mvn_binary_is_bounded() -> io::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let root = dir.path();
-        let real = root.join("real-mvn");
-        File::create(&real)?.sync_all()?;
-
-        // Build a chain of symlinks longer than the 10-hop bound.
-        let mut current = real;
-        for i in 0..15 {
-            let link = root.join(format!("link-{i}"));
-            std::os::unix::fs::symlink(&current, &link)?;
-            current = link;
-        }
-
-        let resolved = resolve_symlinks_bounded(&current);
-        // Bounded resolution must terminate; the final canonical path still exists.
-        assert!(resolved.is_absolute());
-        dir.close()
     }
 }

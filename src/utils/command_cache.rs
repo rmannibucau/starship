@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::fmt::Debug;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -7,9 +9,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::logger::get_log_dir;
+use crate::utils::CommandOutput;
 
-const CACHE_FILE: &str = "maven-cache.json";
-const LOCK_FILE: &str = "maven-cache.json.lock";
+const CACHE_FILE: &str = "commands.json";
+const LOCK_FILE: &str = "commands.json.lock";
 // How old a lock marker must be before it is assumed abandoned (left behind by a crashed
 // process) and reclaimed. Writers only hold the lock for milliseconds, so this short grace makes
 // recovery prompt without evicting an active holder.
@@ -28,12 +31,12 @@ std::thread_local! {
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct Cache {
     #[serde(default)]
-    entries: HashMap<String, CacheEntry>,
+    entries: HashMap<Box<str>, CacheEntry<Box<[u8]>>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-struct CacheEntry {
-    version: String,
+struct CacheEntry<T> {
+    value: T,
     #[serde(default)]
     written_at: u64,
 }
@@ -64,14 +67,82 @@ fn load() -> Cache {
         .unwrap_or_default()
 }
 
-/// Returns the cached version for the given resolved binary path if it is still fresh.
-pub fn get(binary: &Path, ttl: u64) -> Option<String> {
+fn serialize(output: &CommandOutput) -> Box<[u8]> {
+    let mut data = output.stdout.clone().into_bytes();
+    data.extend_from_slice(&[0]);
+    data.extend_from_slice(output.stderr.as_bytes());
+    data.into_boxed_slice()
+}
+
+fn deserialize(data: &[u8]) -> CommandOutput {
+    match data.iter().position(|&b| b == 0) {
+        Some(split) => {
+            let stdout = data.get(..split).unwrap_or_default();
+            let stderr = data.get(split + 1..).unwrap_or_default();
+            CommandOutput {
+                stdout: String::from_utf8_lossy(stdout).into_owned(),
+                stderr: String::from_utf8_lossy(stderr).into_owned(),
+            }
+        }
+        None => CommandOutput {
+            stdout: String::from_utf8_lossy(data).into_owned(),
+            stderr: String::new(),
+        },
+    }
+}
+
+/// Builds a stable cache key for a command invocation. The key incorporates the resolved binary
+/// path (following symlinks, bounded to avoid cycles) so that a change of the underlying
+/// installation (e.g. via SDKMAN) invalidates the cached entry. When the binary cannot be located
+/// the plain command string is used as the key.
+pub fn key<T: AsRef<OsStr> + Debug, U: AsRef<OsStr> + Debug>(cmd: T, args: &[U]) -> String {
+    let mut parts = Vec::new();
+    match resolve_binary(cmd.as_ref()) {
+        Some(path) => parts.push(path.to_string_lossy().into_owned()),
+        None => parts.push(cmd.as_ref().to_string_lossy().into_owned()),
+    }
+    parts.extend(
+        args.iter()
+            .map(|arg| arg.as_ref().to_string_lossy().into_owned()),
+    );
+    parts.join(" ")
+}
+
+/// Resolves `cmd` to its canonical real location, following up to 10 symlink hops.
+fn resolve_binary(cmd: &OsStr) -> Option<PathBuf> {
+    let found = which::which(cmd).ok()?;
+    let mut current = found;
+    for _ in 0..10 {
+        match std::fs::read_link(&current) {
+            Ok(target) => {
+                current = if target.is_absolute() {
+                    target
+                } else {
+                    match current.parent() {
+                        Some(dir) => dir.join(target),
+                        None => target,
+                    }
+                };
+            }
+            Err(_) => break,
+        }
+    }
+
+    Some(dunce::canonicalize(&current).unwrap_or(current))
+}
+
+/// Returns a cached `CommandOutput` for `key` if it exists and has not expired, given a `ttl` in
+/// seconds. A `ttl` of `0` (or less) disables the cache and always returns `None`.
+pub fn get(key: &str, ttl: u64) -> Option<CommandOutput> {
+    if ttl == 0 {
+        return None;
+    }
     let cache = load();
-    let entry = cache.entries.get(&binary.to_string_lossy().into_owned())?;
+    let entry = cache.entries.get(key)?;
     if now().saturating_sub(entry.written_at) > ttl {
         return None;
     }
-    Some(entry.version.clone())
+    Some(deserialize(&entry.value))
 }
 
 /// A best-effort cross-process lock backed by an atomic `create_new` lock file. Serializes
@@ -142,10 +213,14 @@ fn lock_may_be_live(lock_path: &Path) -> bool {
         .unwrap_or(true)
 }
 
-/// Caches the version associated with the resolved binary path using a cross-process lock and an
-/// atomic replace so that concurrent readers never observe a partially written file and concurrent
-/// writers do not overwrite each other's entries.
-pub fn set(binary: &Path, version: String) {
+/// Caches the `CommandOutput` associated with `key`. A `ttl` of `0` (or less) disables the cache
+/// and is a no-op. The write is serialized with a cross-process lock and published atomically so
+/// concurrent readers never observe a partially written file and concurrent writers do not
+/// overwrite each other's entries.
+pub fn set(key: &str, output: CommandOutput, ttl: u64) {
+    if ttl == 0 {
+        return;
+    }
     let path = cache_path();
     let Some(dir) = path.parent() else {
         return;
@@ -162,9 +237,9 @@ pub fn set(binary: &Path, version: String) {
 
     let mut cache = load();
     cache.entries.insert(
-        binary.to_string_lossy().into_owned(),
+        key.into(),
         CacheEntry {
-            version,
+            value: serialize(&output),
             written_at: now(),
         },
     );
@@ -197,56 +272,70 @@ mod tests {
         let _ = dir.close();
     }
 
+    fn sample_output() -> CommandOutput {
+        CommandOutput {
+            stdout: String::from("out"),
+            stderr: String::from("err"),
+        }
+    }
+
     #[test]
     fn set_then_get_within_ttl() {
         with_temp_path(|_| {
-            set(
-                &PathBuf::from("/opt/mvn/4.0.0-rc-6"),
-                "4.0.0-rc-6".to_string(),
-            );
-            assert_eq!(
-                get(&PathBuf::from("/opt/mvn/4.0.0-rc-6"), 3600),
-                Some("4.0.0-rc-6".to_string())
-            );
+            set("mvn --version", sample_output(), 3600);
+            let got = get("mvn --version", 3600).unwrap();
+            assert_eq!(got.stdout, "out");
+            assert_eq!(got.stderr, "err");
         });
     }
 
     #[test]
-    fn different_binary_is_isolated() {
+    fn ttl_zero_disables_cache() {
         with_temp_path(|_| {
-            set(&PathBuf::from("/a"), "1".to_string());
-            set(&PathBuf::from("/b"), "2".to_string());
-            assert_eq!(get(&PathBuf::from("/a"), 3600), Some("1".to_string()));
-            assert_eq!(get(&PathBuf::from("/b"), 3600), Some("2".to_string()));
+            set("cmd", sample_output(), 0);
+            assert_eq!(get("cmd", 0), None);
+            assert_eq!(get("cmd", 3600), None);
+        });
+    }
+
+    #[test]
+    fn different_keys_are_isolated() {
+        with_temp_path(|_| {
+            set("/a", sample_output(), 3600);
+            set(
+                "/b",
+                CommandOutput {
+                    stdout: "2".to_string(),
+                    stderr: String::new(),
+                },
+                3600,
+            );
+            assert_eq!(get("/a", 3600).unwrap().stdout, "out");
+            assert_eq!(get("/b", 3600).unwrap().stdout, "2");
         });
     }
 
     #[test]
     fn stale_entry_is_a_miss() {
         with_temp_path(|path| {
-            std::fs::write(
-                path,
-                serde_json::to_vec(&Cache {
-                    entries: HashMap::from([(
-                        "/mvn".to_string(),
-                        CacheEntry {
-                            version: "old".to_string(),
-                            written_at: now() - 10_000,
-                        },
-                    )]),
-                })
-                .unwrap(),
-            )
-            .unwrap();
+            let mut cache = Cache::default();
+            cache.entries.insert(
+                "/mvn".into(),
+                CacheEntry {
+                    value: serialize(&sample_output()),
+                    written_at: now() - 10_000,
+                },
+            );
+            std::fs::write(path, serde_json::to_vec(&cache).unwrap()).unwrap();
 
-            assert_eq!(get(&PathBuf::from("/mvn"), 3600), None);
+            assert_eq!(get("/mvn", 3600), None);
         });
     }
 
     #[test]
     fn missing_entry_is_a_miss() {
         with_temp_path(|_| {
-            assert_eq!(get(&PathBuf::from("/nope"), 3600), None);
+            assert_eq!(get("/nope", 3600), None);
         });
     }
 
@@ -261,7 +350,14 @@ mod tests {
                     let target = shared.clone();
                     std::thread::spawn(move || {
                         TEST_PATH.with(|p| *p.borrow_mut() = Some(target));
-                        set(&PathBuf::from(format!("/bin/{i}")), i.to_string());
+                        set(
+                            &format!("/bin/{i}"),
+                            CommandOutput {
+                                stdout: i.to_string(),
+                                stderr: String::new(),
+                            },
+                            3600,
+                        );
                     })
                 })
                 .collect();
@@ -270,10 +366,8 @@ mod tests {
             }
 
             for i in 0..8 {
-                assert_eq!(
-                    get(&PathBuf::from(format!("/bin/{i}")), 3600),
-                    Some(i.to_string())
-                );
+                let got = get(&format!("/bin/{i}"), 3600).unwrap();
+                assert_eq!(got.stdout, i.to_string());
             }
         });
     }

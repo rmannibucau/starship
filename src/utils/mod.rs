@@ -1,3 +1,4 @@
+pub mod command_cache;
 pub mod env;
 pub mod serde;
 pub mod statusline;
