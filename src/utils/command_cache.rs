@@ -68,35 +68,68 @@ fn load() -> Cache {
 }
 
 fn serialize(output: &CommandOutput) -> Box<[u8]> {
-    let mut data = output.stdout.clone().into_bytes();
-    data.extend_from_slice(&[0]);
-    data.extend_from_slice(output.stderr.as_bytes());
+    let stdout = output.stdout.as_bytes();
+    let stderr = output.stderr.as_bytes();
+    let mut data = Vec::with_capacity(8 + stdout.len() + stderr.len());
+    // Length-prefixed encoding so that arbitrary output (including a NUL byte) round-trips
+    // without ambiguity between stdout and stderr.
+    data.extend_from_slice(&(stdout.len() as u32).to_le_bytes());
+    data.extend_from_slice(stdout);
+    data.extend_from_slice(&(stderr.len() as u32).to_le_bytes());
+    data.extend_from_slice(stderr);
     data.into_boxed_slice()
 }
 
 fn deserialize(data: &[u8]) -> CommandOutput {
-    match data.iter().position(|&b| b == 0) {
-        Some(split) => {
-            let stdout = data.get(..split).unwrap_or_default();
-            let stderr = data.get(split + 1..).unwrap_or_default();
-            CommandOutput {
-                stdout: String::from_utf8_lossy(stdout).into_owned(),
-                stderr: String::from_utf8_lossy(stderr).into_owned(),
-            }
-        }
-        None => CommandOutput {
-            stdout: String::from_utf8_lossy(data).into_owned(),
-            stderr: String::new(),
-        },
-    }
+    let mut offset = 0;
+    let stdout = {
+        let stdout_len = read_length(data, &mut offset);
+        let bytes = data
+            .get(offset..offset.saturating_add(stdout_len))
+            .unwrap_or_default();
+        offset = offset.saturating_add(stdout_len);
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    let stderr = {
+        let stderr_len = read_length(data, &mut offset);
+        let bytes = data
+            .get(offset..offset.saturating_add(stderr_len))
+            .unwrap_or_default();
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    CommandOutput { stdout, stderr }
 }
 
-/// Builds a stable cache key for a command invocation. The key incorporates the resolved binary
-/// path (following symlinks, bounded to avoid cycles) so that a change of the underlying
-/// installation (e.g. via SDKMAN) invalidates the cached entry. When the binary cannot be located
-/// the plain command string is used as the key.
-pub fn key<T: AsRef<OsStr> + Debug, U: AsRef<OsStr> + Debug>(cmd: T, args: &[U]) -> String {
+/// Reads a 32-bit little-endian length from `bytes` starting at `offset`, advancing `offset` past
+/// it. Returns `0` on a truncated or out-of-range payload so the reader degrades gracefully.
+fn read_length(bytes: &[u8], offset: &mut usize) -> usize {
+    if bytes.len().saturating_sub(*offset) < 4 {
+        return 0;
+    }
+    let len = u32::from_le_bytes(bytes[*offset..*offset + 4].try_into().unwrap()) as usize;
+    *offset += 4;
+    len
+}
+
+/// Builds a stable cache key for a command invocation.
+///
+/// The key incorporates the resolved binary path (following symlinks, bounded to avoid cycles) so
+/// that a change of the underlying installation (e.g. via SDKMAN) invalidates the cached entry;
+/// when the binary cannot be located the plain command string is used. When `cwd` is provided it is
+/// prepended so that directory-dependent commands (e.g. `git branch`) do not collide across
+/// projects. Callers whose output is context-independent (e.g. `mvn --version`) pass `None`.
+///
+/// Each part is encoded as `len:value` (with the byte length) so that distinct argument vectors
+/// such as `['a b']` and `['a', 'b']` do not share a key.
+pub fn key<T: AsRef<OsStr> + Debug, U: AsRef<OsStr> + Debug>(
+    cwd: Option<&Path>,
+    cmd: T,
+    args: &[U],
+) -> String {
     let mut parts = Vec::new();
+    if let Some(cwd) = cwd {
+        parts.push(cwd.to_string_lossy().into_owned());
+    }
     match resolve_binary(cmd.as_ref()) {
         Some(path) => parts.push(path.to_string_lossy().into_owned()),
         None => parts.push(cmd.as_ref().to_string_lossy().into_owned()),
@@ -105,7 +138,11 @@ pub fn key<T: AsRef<OsStr> + Debug, U: AsRef<OsStr> + Debug>(cmd: T, args: &[U])
         args.iter()
             .map(|arg| arg.as_ref().to_string_lossy().into_owned()),
     );
-    parts.join(" ")
+    parts
+        .into_iter()
+        .map(|part| format!("{}:{part}", part.len()))
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 /// Resolves `cmd` to its canonical real location, following up to 10 symlink hops.
@@ -370,6 +407,52 @@ mod tests {
                 assert_eq!(got.stdout, i.to_string());
             }
         });
+    }
+
+    #[test]
+    fn serialization_round_trips_nul_bytes() {
+        let output = CommandOutput {
+            stdout: "line\x00with nul".to_string(),
+            stderr: "err\x00too".to_string(),
+        };
+        let data = serialize(&output);
+        let back = deserialize(&data);
+        assert_eq!(back.stdout, "line\x00with nul");
+        assert_eq!(back.stderr, "err\x00too");
+    }
+
+    #[test]
+    fn serialization_round_trips_empty_stderr() {
+        let output = CommandOutput {
+            stdout: "out".to_string(),
+            stderr: String::new(),
+        };
+        let back = deserialize(&serialize(&output));
+        assert_eq!(back.stdout, "out");
+        assert_eq!(back.stderr, "");
+    }
+
+    #[test]
+    fn key_distinguishes_argument_boundaries() {
+        // `['mvn', '--version']` must not collide with a single argument that contains a space.
+        assert_ne!(
+            key(None, "cmd", &["a b"] as &[&str; 1]),
+            key(None, "cmd", &["a", "b"] as &[&str; 2]),
+        );
+    }
+
+    #[test]
+    fn key_includes_cwd_when_provided() {
+        let a = key(Some(Path::new("/proj/a")), "git", &["branch"]);
+        let b = key(Some(Path::new("/proj/b")), "git", &["branch"]);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn key_is_stable_without_cwd() {
+        let a = key(None, "git", &["branch"]);
+        let b = key(None, "git", &["branch"]);
+        assert_eq!(a, b);
     }
 
     #[test]

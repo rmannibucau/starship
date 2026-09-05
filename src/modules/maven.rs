@@ -88,15 +88,15 @@ fn parse_maven_version_from_properties(wrapper_properties: &str) -> Option<Strin
     Some(version.to_string())
 }
 
-/// The version of the `mvn` binary installed on the machine, resolved if available and not
-/// served by the shared persistent cache.
+/// The version of the `mvn` binary installed on the machine, resolved if available.
 fn get_mvn_version(context: &Context, cache_enabled: bool, cache_ttl: u64) -> Option<String> {
     let binary_name = if cfg!(windows) { "mvn.cmd" } else { "mvn" };
-    // The shared cache key incorporates the resolved binary (e.g. an SDKMAN-managed version), so
-    // a change of the underlying installation naturally invalidates the cached entry.
-    let key = command_cache::key(binary_name, &["--version"]);
+    // The Maven version key is context-independent: the resolved binary (e.g. an SDKMAN-managed
+    // installation) fully determines the output, so a change of the underlying installation
+    // naturally invalidates the entry without being scoped to a directory.
+    let key = command_cache::key(None, binary_name, &["--version"]);
 
-    // Serve from the shared cache first when it is enabled and the entry is fresh enough.
+    // Serve from the module cache first when it is enabled and the entry is fresh enough.
     if cache_enabled
         && let Some(output) = command_cache::get(&key, cache_ttl)
         && let Some(version) = parse_mvn_version(&output.stdout)
@@ -104,7 +104,9 @@ fn get_mvn_version(context: &Context, cache_enabled: bool, cache_ttl: u64) -> Op
         return Some(version);
     }
 
-    let output = context.exec_cmd(binary_name, &["--version"])?;
+    // Read directly from the binary, bypassing the global (directory-scoped) command cache, so a
+    // module-level `cache = false` disables caching for this lookup as the user asked.
+    let output = context.exec_cmd_no_cache(binary_name, &["--version"])?;
     let version = parse_mvn_version(&output.stdout)?;
 
     if cache_enabled {
